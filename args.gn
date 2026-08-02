@@ -36,3 +36,4 @@ include_both_v8_snapshots_android_secondary_abi = false
 v8_enable_drumbrake = true
 v8_drumbrake_bounds_checks = true 
 generate_linker_map = true
+ccache_prefix = "ccache"
