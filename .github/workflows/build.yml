@@ -14,6 +14,7 @@ permissions:
 jobs:
   build:
     runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'self-hosted' }}
+    timeout-minutes: 7200
     steps:
       - uses: actions/checkout@v5
         with:
