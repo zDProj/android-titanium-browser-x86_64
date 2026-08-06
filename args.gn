@@ -7,7 +7,6 @@ is_debug = false
 is_official_build = true
 symbol_level = 0
 blink_symbol_level = 0
-concurrent_links = 1
 enable_nacl = false
 enable_java_asserts = false
 disable_fieldtrial_testing_config = true
