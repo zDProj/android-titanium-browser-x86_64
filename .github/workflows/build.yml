@@ -11,6 +11,10 @@ permissions:
   contents: write
   id-token: write
   attestations: write
+env:
+  CCACHE_COMPRESS: 1
+  PYTHONUNBUFFERED: "1"
+  NINJA_STATUS: "[%f/%t %p %e]"
 jobs:
   build:
     runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'self-hosted' }}
@@ -44,7 +48,7 @@ jobs:
             LOCAL_TEST_JKS: ${{ secrets.LOCAL_TEST_JKS }}
             STORE_TEST_JKS: ${{ secrets.STORE_TEST_JKS }}
         run: |
-          ./build.sh
+          stdbuf -oL -eL ./build.sh
       - name: Set
         run: |
           export VERSION=$(find chromium/src/out/release -name '*x86_64.apk' | sed 's/.*\///;s/\-x86_64.apk$//')
