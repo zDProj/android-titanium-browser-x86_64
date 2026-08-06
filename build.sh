@@ -37,7 +37,7 @@ cp $SCRIPT_DIR/args.gn out/Default/args.gn
 gn gen out/Default # gn args out/Default; echo 'treat_warnings_as_errors = false' >> out/Default/args.gn
 mkdir -p out/tmp out/release
 
-autoninja -C out/Default chrome_public_apk
+stdbuf -oL -eL autoninja -C out/Default chrome_public_apk
 mv $(find out/Default/apks -name 'Chrome*.apk') out/tmp/$VERSION-x86_64.apk
 
 export PATH=$PWD/third_party/jdk/current/bin/:$PATH
