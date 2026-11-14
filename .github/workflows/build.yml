@@ -12,6 +12,7 @@ permissions:
   id-token: write
   attestations: write
 env:
+  CCACHE_DIR: /data/ccache-browser
   CCACHE_COMPRESS: 1
   PYTHONUNBUFFERED: "1"
   NINJA_STATUS: "[%f/%t %p %e]"
