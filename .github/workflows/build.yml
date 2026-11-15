@@ -12,6 +12,7 @@ permissions:
   id-token: write
   attestations: write
 env:
+  CCACHE_DIR: /data/ccache-browser
   CCACHE_COMPRESS: 1
   PYTHONUNBUFFERED: "1"
   NINJA_STATUS: "[%f/%t %p %e]"
@@ -23,6 +24,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: true
+          clean: false
       
       - name: Update 
         run: |
@@ -48,7 +50,7 @@ jobs:
             LOCAL_TEST_JKS: ${{ secrets.LOCAL_TEST_JKS }}
             STORE_TEST_JKS: ${{ secrets.STORE_TEST_JKS }}
         run: |
-          stdbuf -oL -eL ./build.sh
+          python3 -u stream_build.py ./build.sh
       - name: Set
         run: |
           export VERSION=$(find chromium/src/out/release -name '*x86_64.apk' | sed 's/.*\///;s/\-x86_64.apk$//')
@@ -69,11 +71,9 @@ jobs:
             ${{ env.VERSION }}-${{ env.unix_time }}-x86_64.apk
       - name: Trigger VM Deallocation
         run: |
-          if [ -f /data/deallocate.sh ]; then
+          if [ -x /data/deallocate.sh ]; then
             echo "Build, publish, and attestation completed successfully."
-            echo "Triggering background VM deallocation in 2 minutes to allow post-jobs to complete..."
-            nohup setsid bash -c 'sleep 120 && /data/deallocate.sh' </dev/null >/tmp/deallocate.log 2>&1 &
-            echo "Deallocation timer started in background."
+            /data/deallocate.sh 120
           else
             echo "Local /data/deallocate.sh not found, skipping VM deallocation."
           fi
