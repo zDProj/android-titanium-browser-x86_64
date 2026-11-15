@@ -9,13 +9,13 @@ sudo apt-get update
 sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
 sudo dpkg --add-architecture i386; sudo apt-get update; sudo apt-get install -y libgcc-s1:i386
 
-git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+[ -d depot_tools ] || git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
 export PATH="$PWD/depot_tools:$PATH"
 mkdir -p chromium/src/out/Default; cd chromium/src
 git init
-git remote add origin $CHROMIUM_SOURCE
+git remote get-url origin >/dev/null 2>&1 || git remote add origin $CHROMIUM_SOURCE
 git fetch --depth 1 $CHROMIUM_SOURCE +refs/tags/$VERSION:chromium_$VERSION
-git checkout $VERSION
+git checkout $VERSION || true
 cp $SCRIPT_DIR/.gclient ../.gclient
 
 # https://grapheneos.org/build#browser-and-webview
@@ -28,7 +28,7 @@ rm -rf $SCRIPT_DIR/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button,
 replace "$SCRIPT_DIR/vanadium/patches" "VANADIUM" "TITANIUM"
 replace "$SCRIPT_DIR/vanadium/patches" "Vanadium" "Titanium"
 replace "$SCRIPT_DIR/vanadium/patches" "vanadium" "titanium"
-git am --whitespace=nowarn --keep-non-patch $SCRIPT_DIR/vanadium/patches/*.patch
+git am --whitespace=nowarn --keep-non-patch $SCRIPT_DIR/vanadium/patches/*.patch || true
 
 gclient sync -D --no-history --nohooks
 gclient runhooks

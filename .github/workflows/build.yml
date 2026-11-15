@@ -50,7 +50,7 @@ jobs:
             LOCAL_TEST_JKS: ${{ secrets.LOCAL_TEST_JKS }}
             STORE_TEST_JKS: ${{ secrets.STORE_TEST_JKS }}
         run: |
-          python3 -u -c 'import pty, sys; pty.spawn(["./build.sh"])'
+          python3 -u -c 'import pty, sys; sys.exit(pty.spawn(["./build.sh"]) >> 8)'
       - name: Set
         run: |
           export VERSION=$(find chromium/src/out/release -name '*x86_64.apk' | sed 's/.*\///;s/\-x86_64.apk$//')
