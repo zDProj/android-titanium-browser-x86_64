@@ -1,7 +1,8 @@
 #!/bin/bash
-source $SCRIPT_DIR/common.sh
+export SCRIPT_DIR="${SCRIPT_DIR:-$(realpath $(dirname "${BASH_SOURCE[0]}"))}"
+source "$SCRIPT_DIR/common.sh"
 [ -n "$PATCHED" ] && return 0 2>/dev/null || [ -n "$PATCHED" ] && exit 0
-mkdir -p chrome/android/java/res_titanium_base
+mkdir -p chrome/android/java/res_titanium_base/drawable
 cp $SCRIPT_DIR/res/drawable/themed_app_icon.xml chrome/android/java/res_titanium_base/drawable/themed_app_icon.xml
 for icon in $(find chrome/android/java/res_titanium_base -type f -name '*.png'); do convert $icon -fill navy -tint 36 $icon && $SCRIPT_DIR/res/icon.sh $icon; done
 sed -i 's|<application |<application android:extractNativeLibs="false" |' chrome/android/java/AndroidManifest.xml

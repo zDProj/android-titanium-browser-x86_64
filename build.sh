@@ -14,21 +14,24 @@ export PATH="$PWD/depot_tools:$PATH"
 mkdir -p chromium/src/out/Default; cd chromium/src
 git init
 git remote get-url origin >/dev/null 2>&1 || git remote add origin $CHROMIUM_SOURCE
-git fetch --depth 1 $CHROMIUM_SOURCE +refs/tags/$VERSION:chromium_$VERSION
-git checkout $VERSION || true
-cp $SCRIPT_DIR/.gclient ../.gclient
+if ! git rev-parse --verify main >/dev/null 2>&1; then
+  git fetch --depth 1 $CHROMIUM_SOURCE +refs/tags/$VERSION:chromium_$VERSION
+  git checkout $VERSION
+  cp $SCRIPT_DIR/.gclient ../.gclient
 
-# https://grapheneos.org/build#browser-and-webview
-rm -rf $SCRIPT_DIR/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
-rm -rf $SCRIPT_DIR/vanadium/patches/*{detailed,supported}-language*.patch
-rm -rf $SCRIPT_DIR/vanadium/patches/*javascript-optimizer-{site-setting,settings-UI}.patch
-rm -rf $SCRIPT_DIR/vanadium/patches/*component-updates.patch
-rm -rf $SCRIPT_DIR/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button,configs-from-config-app,config-app-parsing,new-tab-card,predictive-back}*.patch
-# rm -rf $SCRIPT_DIR/vanadium/patches/*crashpad*.patch
-replace "$SCRIPT_DIR/vanadium/patches" "VANADIUM" "TITANIUM"
-replace "$SCRIPT_DIR/vanadium/patches" "Vanadium" "Titanium"
-replace "$SCRIPT_DIR/vanadium/patches" "vanadium" "titanium"
-git am --whitespace=nowarn --keep-non-patch $SCRIPT_DIR/vanadium/patches/*.patch || true
+  # https://grapheneos.org/build#browser-and-webview
+  rm -rf $SCRIPT_DIR/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
+  rm -rf $SCRIPT_DIR/vanadium/patches/*{detailed,supported}-language*.patch
+  rm -rf $SCRIPT_DIR/vanadium/patches/*javascript-optimizer-{site-setting,settings-UI}.patch
+  rm -rf $SCRIPT_DIR/vanadium/patches/*component-updates.patch
+  rm -rf $SCRIPT_DIR/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button,configs-from-config-app,config-app-parsing,new-tab-card,predictive-back}*.patch
+  # rm -rf $SCRIPT_DIR/vanadium/patches/*crashpad*.patch
+  replace "$SCRIPT_DIR/vanadium/patches" "VANADIUM" "TITANIUM"
+  replace "$SCRIPT_DIR/vanadium/patches" "Vanadium" "Titanium"
+  replace "$SCRIPT_DIR/vanadium/patches" "vanadium" "titanium"
+  git am --whitespace=nowarn --keep-non-patch $SCRIPT_DIR/vanadium/patches/*.patch
+  git branch -M main
+fi
 
 gclient sync -D --no-history --nohooks
 gclient runhooks
