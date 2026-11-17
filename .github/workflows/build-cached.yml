@@ -135,7 +135,10 @@ jobs:
         id: ccache-restore
         uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/ccache
+          # env.CCACHE_DIR is unset until 'Set environment' runs, so restores
+          # fall back to ~/.cache/ccache; saves (later in the job) use the
+          # runner-specific dir the build actually wrote to
+          path: ${{ env.CCACHE_DIR || '~/.cache/ccache' }}
           key: ccache-x64-${{ env.VERSION }}-${{ github.run_id }}
           restore-keys: |
             ccache-x64-${{ env.VERSION }}-
@@ -349,7 +352,7 @@ jobs:
         if: always() && steps.build.outputs.save_cache == 'true'
         uses: actions/cache/save@v4
         with:
-          path: ~/.cache/ccache
+          path: ${{ env.CCACHE_DIR || '~/.cache/ccache' }}
           key: ccache-x64-${{ env.VERSION }}-${{ github.run_id }}
 
       # ─── Purge old ccache entries from actions/cache ───────────────────
