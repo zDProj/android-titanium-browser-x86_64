@@ -218,6 +218,11 @@ jobs:
                 | tar -I zstd -xf - -C "$GITHUB_WORKSPACE"
               rm -f cache/"${tag}"-part-*
 
+          # Never carry finished APK artifacts inside the cache: a restored
+          # tree that contains one looks already-finished (had_apk=true) and
+          # cache consumers skip the build entirely
+          rm -f chromium/src/out/release/*.apk
+
               echo "Restored: $(du -sh chromium 2>/dev/null | cut -f1)"
               echo "::notice::Resumed tree objects=$(find chromium/src/out -name '*.o' 2>/dev/null | wc -l)"
             fi
@@ -428,7 +433,7 @@ jobs:
 
           # PAX format preserves sub-second mtimes so siso doesn't consider
           # restored objects stale (critical for incremental build correctness)
-          tar --format=pax -I 'zstd -1 -T0' -cf cache/tree.tar.zst chromium
+          tar --format=pax --exclude='chromium/src/out/release/*.apk' -I 'zstd -1 -T0' -cf cache/tree.tar.zst chromium
           split -b 1500M -d -a 3 cache/tree.tar.zst "cache/${tag}-part-"
           rm -f cache/tree.tar.zst
           parts=$(find cache -maxdepth 1 -name "${tag}-part-*" | wc -l)
