@@ -1,0 +1,601 @@
+name: Build (Cached)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner to use (ubuntu-latest for GitHub-hosted, self-hosted for local)'
+        required: true
+        type: choice
+        options:
+          - ubuntu-latest
+          - self-hosted
+        default: 'ubuntu-latest'
+      action:
+        description: 'Build action: continue (resume from cache), reset (fresh build), seed (self-hosted cache fill), probe (inspect cache only)'
+        required: true
+        type: choice
+        options:
+          - continue
+          - reset
+          - seed
+          - probe
+        default: continue
+      build_minutes:
+        description: 'Minutes of compilation budget per session (keep ≤ 300 for GitHub-hosted)'
+        required: true
+        type: string
+        default: '300'
+      auto_chain:
+        description: 'Automatically queue the next session if build is incomplete'
+        required: true
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+        default: 'true'
+      max_sessions:
+        description: 'Maximum number of chained sessions before stopping'
+        required: true
+        type: string
+        default: '24'
+      min_progress:
+        description: 'Minimum ninja targets that must be cleared per session to continue chaining'
+        required: true
+        type: string
+        default: '2000'
+
+  schedule:
+    # Biweekly build check - runs every other Monday at midnight UTC
+    - cron: '0 0 1,15 * *'
+
+permissions:
+  contents: write
+  actions: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: cached-build-${{ inputs.action == 'probe' && 'probe' || 'build' }}
+  cancel-in-progress: false
+
+env:
+  CCACHE_COMPRESS: 'true'
+  CCACHE_COMPRESSLEVEL: '1'
+  CCACHE_MAXSIZE: '6G'
+  CCACHE_SLOPPINESS: 'time_macros,include_file_mtime,include_file_ctime,file_stat_matches,pch_defines'
+  CCACHE_NOHASHDIR: '1'
+  PYTHONUNBUFFERED: '1'
+  NINJA_STATUS: '[%f/%t %p %e]'
+
+jobs:
+  build:
+    if: inputs.action != 'probe' || true
+    outputs:
+      has_apk: ${{ steps.hasapk.outputs.value }}
+    runs-on: ${{ (inputs.action == 'seed' && 'self-hosted') || (github.event_name == 'workflow_dispatch' && inputs.runner) || 'ubuntu-latest' }}
+    timeout-minutes: 355
+    steps:
+      # ─── Reclaim disk space on GitHub-hosted runners ───────────────────
+      - name: Free disk space (GitHub-hosted)
+        if: runner.environment == 'github-hosted' || inputs.runner == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          echo "free before: $(df -BG --output=avail / | tail -1 | awk '{print $1}')"
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /opt/az \
+            /usr/local/aws-cli \
+            /opt/microsoft \
+            /usr/local/share/powershell \
+            /usr/lib/mono
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo apt-get clean
+          command -v zstd >/dev/null || sudo apt-get install -y zstd
+          echo "free after: $(df -BG --output=avail / | tail -1 | awk '{print $1}')"
+
+      # ─── Checkout build scripts ────────────────────────────────────────
+      - name: Checkout build scripts
+        uses: actions/checkout@v5
+        with:
+          clean: false
+          submodules: recursive
+
+      # ─── Determine Chromium version ────────────────────────────────────
+      - name: Get Chromium version
+        run: |
+          VERSION=$(grep -m1 -oE '[0-9]+(\.[0-9]+){3}' vanadium/args.gn)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine Chromium VERSION from vanadium/args.gn"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building Chromium $VERSION"
+
+      # ─── Compute recipe fingerprint for cache validation ───────────────
+      - name: Compute recipe fingerprint
+        id: recipe
+        run: |
+          recipe=$(
+            { cat args.gn patch.sh .gclient 2>/dev/null
+              git -C vanadium rev-parse HEAD 2>/dev/null || echo no-vanadium
+            } | sha256sum | cut -d' ' -f1
+          )
+          echo "fingerprint=$recipe" >> "$GITHUB_OUTPUT"
+          echo "Recipe fingerprint: $recipe"
+
+      # ─── Restore ccache from actions/cache ─────────────────────────────
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-x64-${{ env.VERSION }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-x64-${{ env.VERSION }}-
+            ccache-x64-
+
+      # ─── Restore build tree from GitHub Releases ───────────────────────
+      - name: Restore build tree cache
+        id: restore
+        if: inputs.action == 'continue' || inputs.action == 'probe' || inputs.action == 'seed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge 5 ]; then
+                echo "::error::gave up after $n attempts: $*" >&2
+                return 1
+              fi
+              echo "attempt $n failed for: $* (retrying in $((n * 20))s)" >&2
+              sleep $((n * 20))
+            done
+          }
+
+          generation=0
+          pending=''
+
+          if gh release view build-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            mkdir -p cache
+            retry gh release download build-cache --repo "$GITHUB_REPOSITORY" \
+              --pattern manifest.txt --dir cache --clobber || true
+
+            if [ ! -f cache/manifest.txt ]; then
+              echo "::notice::No manifest in build-cache release; starting cold"
+              echo "generation=0" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            cached_recipe=$(sed -n 's/^recipe=//p' cache/manifest.txt)
+            generation=$(sed -n 's/^generation=//p' cache/manifest.txt)
+            parts=$(sed -n 's/^parts=//p' cache/manifest.txt)
+            pending=$(sed -n 's/^remaining=//p' cache/manifest.txt)
+            tag=$(printf 'g%03d' "$generation")
+
+            recipe="${{ steps.recipe.outputs.fingerprint }}"
+
+            restore=false
+            if [ -z "$cached_recipe" ]; then
+              echo "::warning::$tag has no recipe fingerprint; resuming anyway"
+              restore=true
+            elif [ "$cached_recipe" = "$recipe" ]; then
+              restore=true
+            else
+              echo "::notice::$tag was built from recipe $cached_recipe, current is $recipe; starting cold"
+              pending=''
+            fi
+
+            if [ "$restore" = "true" ]; then
+              echo "Restoring $tag ($parts parts)..."
+              for p in $(seq -f '%03g' 0 $((parts - 1))); do
+                while [ ! -s "cache/${tag}-part-${p}" ]; do
+                  retry gh release download build-cache --repo "$GITHUB_REPOSITORY" \
+                    --pattern "${tag}-part-${p}" --dir cache --clobber
+                done
+              done
+
+              found=$(find cache -maxdepth 1 -name "${tag}-part-*" | wc -l)
+              if [ "$found" -ne "$parts" ]; then
+                echo "::error::Cache generation $tag incomplete: $found of $parts parts"
+                exit 1
+              fi
+
+              find cache -maxdepth 1 -name "${tag}-part-*" | sort | xargs cat \
+                | tar -I zstd -xf - -C "$GITHUB_WORKSPACE"
+              rm -f cache/"${tag}"-part-*
+
+              echo "Restored: $(du -sh chromium 2>/dev/null | cut -f1)"
+              echo "::notice::Resumed tree objects=$(find chromium/src/out -name '*.o' 2>/dev/null | wc -l)"
+            fi
+            rm -f cache/manifest.txt
+          fi
+
+          echo "generation=$generation" >> "$GITHUB_OUTPUT"
+          echo "pending=${pending:-}" >> "$GITHUB_OUTPUT"
+
+          if compgen -G "chromium/src/out/release/*.apk" >/dev/null; then
+            echo "had_apk=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "had_apk=false" >> "$GITHUB_OUTPUT"
+          fi
+          df -h /
+
+      # ─── Probe: inspect the cached tree without building ───────────────
+      - name: Inspect cached tree
+        if: inputs.action == 'probe'
+        run: |
+          set +e; set -u
+          outdir=chromium/src/out/Default
+          objects=$(find chromium/src/out -name '*.o' 2>/dev/null | wc -l)
+          nlog=$outdir/.ninja_log
+          rows=$( [ -f "$nlog" ] && wc -l < "$nlog" || echo absent )
+          prepared=$( [ -f "$outdir/.titanium-prepared" ] && echo yes || echo no )
+          echo "::notice::probe objects=$objects ninjaLogRows=$rows prepared=$prepared"
+          du -sh "$outdir" 2>/dev/null
+          echo "=== ccache stats ==="
+          ccache -s 2>/dev/null || echo "ccache not available"
+          df -h /
+
+      # ─── Set environment ───────────────────────────────────────────────
+      - name: Set environment
+        if: inputs.action != 'probe'
+        run: |
+          chmod +x *.sh *.py 2>/dev/null || true
+          echo "unix_time=$(date +%s)" >> "$GITHUB_ENV"
+
+          # Set CCACHE_DIR based on runner type
+          if [ "${{ inputs.runner }}" = "self-hosted" ] || [ "${{ inputs.action }}" = "seed" ]; then
+            echo "CCACHE_DIR=/data/ccache-browser" >> "$GITHUB_ENV"
+          else
+            echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          fi
+
+      # ─── Build ─────────────────────────────────────────────────────────
+      - name: Build
+        id: build
+        if: inputs.action != 'probe' && steps.restore.outputs.had_apk != 'true'
+        continue-on-error: true
+        timeout-minutes: 320
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          LOCAL_TEST_JKS: ${{ secrets.LOCAL_TEST_JKS }}
+          STORE_TEST_JKS: ${{ secrets.STORE_TEST_JKS }}
+          RESUME: ${{ (inputs.action == 'continue' || inputs.action == 'seed') && '1' || '0' }}
+        run: |
+          # Mark cache for saving even if build is interrupted
+          echo "save_cache=true" >> "$GITHUB_OUTPUT"
+
+          set -o pipefail
+          set +e
+
+          budget="${{ inputs.build_minutes }}"
+          case "$budget" in
+            ''|*[!0-9]*) echo "::error::build_minutes must be a number" >&2; exit 2 ;;
+          esac
+
+          started=$(date +%s)
+          timeout --signal=INT --kill-after=120s "${budget}m" \
+            python3 -u stream_build.py ./build.sh 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          status=${PIPESTATUS[0]}
+          ran=$(( $(date +%s) - started ))
+
+          budget_hit=false
+          if [ "$status" != "0" ] && [ "$ran" -ge $(( budget * 60 - 15 )) ]; then
+            budget_hit=true
+            echo "::notice::Build budget of ${budget}m expired after ${ran}s — tree will be cached for next session"
+          fi
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "seconds=$ran" >> "$GITHUB_OUTPUT"
+          echo "budget=$budget_hit" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      # ─── Report progress ───────────────────────────────────────────────
+      - name: Report progress
+        id: progress
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "budget=${{ steps.build.outputs.budget }}" >> "$GITHUB_OUTPUT"
+          if [ -f build.log ]; then
+            last=$(grep -oE '\[[0-9]+/[0-9]+\]' build.log | tail -1 || true)
+            echo "Last ninja counter: ${last:-not reached}"
+            summary=$(grep -oE '[0-9]+ done, [0-9]+ failed, [0-9]+ remaining' build.log | tail -1 || true)
+            echo "::notice::${summary:-no siso summary in the log}"
+            echo "remaining=$(printf '%s' "$summary" | awk '{print $5}')" >> "$GITHUB_OUTPUT"
+            tail -n 20 build.log
+          fi
+          df -h /
+
+      # ─── ccache statistics ─────────────────────────────────────────────
+      - name: ccache stats
+        if: always()
+        run: |
+          echo "=== ccache stats (current run) ==="
+          ccache --version 2>/dev/null | head -1 || true
+          ccache --show-stats -v 2>/dev/null || ccache --show-stats 2>/dev/null || ccache -s 2>/dev/null || echo "ccache not available"
+          echo "=== cache size ==="
+          du -sh "$CCACHE_DIR" 2>/dev/null || du -sh "$HOME/.cache/ccache" 2>/dev/null || true
+
+          # Summary in Job Summary
+          {
+            echo ""
+            echo "### ccache stats"
+            echo ""
+            STATS=$(ccache --print-stats 2>/dev/null || true)
+            HITS=$(echo "$STATS" | awk -F'\t' '/^(direct_cache_hit|preprocessed_cache_hit)/{h+=$2} END{print h+0}')
+            MISS=$(echo "$STATS" | awk -F'\t' '/^cache_miss/{print $2+0}')
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| hits | ${HITS:-0} |"
+            echo "| misses | ${MISS:-0} |"
+            echo ""
+            echo "Cold run ≈ 0 hits. From the second run onward, hits should be high."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ─── Save ccache to actions/cache ──────────────────────────────────
+      - name: Save ccache
+        if: always() && steps.build.outputs.save_cache == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-x64-${{ env.VERSION }}-${{ github.run_id }}
+
+      # ─── Purge old ccache entries from actions/cache ───────────────────
+      - name: Purge old ccache entries
+        if: always() && steps.build.outputs.save_cache == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KEEP="ccache-x64-${{ env.VERSION }}-${{ github.run_id }}"
+          echo "Keeping: $KEEP"
+          gh cache list -R "${{ github.repository }}" --limit 100 --json id,key \
+            --jq ".[] | select(.key | startswith(\"ccache-x64-\")) | select(.key != \"$KEEP\") | .id" \
+            | while read -r id; do
+                echo "Deleting old cache id=$id"
+                gh cache delete "$id" -R "${{ github.repository }}" || true
+              done
+
+      # ─── Check for APK ─────────────────────────────────────────────────
+      - name: Check for APK
+        id: hasapk
+        if: always() && inputs.action != 'probe'
+        run: |
+          if compgen -G "chromium/src/out/release/*.apk" >/dev/null; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+            echo "This session produced an APK"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ─── Save build tree to GitHub Releases ────────────────────────────
+      - name: Save build tree cache
+        if: always() && inputs.action != 'probe'
+        timeout-minutes: 80
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge 5 ]; then
+                echo "::error::gave up after $n attempts: $*" >&2
+                return 1
+              fi
+              echo "attempt $n failed for: $* (retrying in $((n * 20))s)" >&2
+              sleep $((n * 20))
+            done
+          }
+
+          cd "$GITHUB_WORKSPACE"
+
+          # Don't re-cache if the APK was already in the restored tree
+          if compgen -G "chromium/src/out/release/*-unsigned.apk" >/dev/null \
+             && [ '${{ steps.restore.outputs.had_apk }}' = 'true' ]; then
+            echo "::notice::APK already present from cache; no new data to save"
+            exit 0
+          fi
+
+          if [ ! -f chromium/src/out/Default/.titanium-prepared ]; then
+            echo "::warning::Checkout not prepared (incomplete sync); nothing to cache"
+            exit 0
+          fi
+
+          previous='${{ steps.restore.outputs.generation }}'
+          generation=$(( ${previous:-0} + 1 ))
+          tag=$(printf 'g%03d' "$generation")
+          rm -rf cache; mkdir -p cache
+
+          echo "::notice::Caching tree: objects=$(find chromium/src/out -name '*.o' 2>/dev/null | wc -l)"
+
+          # PAX format preserves sub-second mtimes so siso doesn't consider
+          # restored objects stale (critical for incremental build correctness)
+          tar --format=pax -I 'zstd -1 -T0' -cf cache/tree.tar.zst chromium
+          split -b 1500M -d -a 3 cache/tree.tar.zst "cache/${tag}-part-"
+          rm -f cache/tree.tar.zst
+          parts=$(find cache -maxdepth 1 -name "${tag}-part-*" | wc -l)
+          echo "Cache ${tag}: ${parts} parts, $(du -sh cache | cut -f1)"
+
+          # Create build-cache release if it doesn't exist
+          gh release view build-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create build-cache --repo "$GITHUB_REPOSITORY" \
+                 --title "Build cache (internal)" \
+                 --notes "Machine-generated Chromium build cache for chained builds. Not a release; do not download." \
+                 --prerelease
+
+          # Remove stale parts from same generation tag
+          gh release view build-cache --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' 2>/dev/null \
+            | grep -E "^${tag}-part-" \
+            | while read -r old; do
+                gh release delete-asset build-cache "$old" --repo "$GITHUB_REPOSITORY" --yes >/dev/null
+              done || true
+
+          # Upload new parts
+          for f in cache/"${tag}"-part-*; do
+            retry gh release upload build-cache "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+
+          # Write manifest last — a half-uploaded generation is never advertised
+          recipe="${{ steps.recipe.outputs.fingerprint }}"
+          printf 'generation=%d\nparts=%d\ncommit=%s\nrecipe=%s\nremaining=%s\n' \
+            "$generation" "$parts" "$GITHUB_SHA" "$recipe" \
+            "${{ steps.progress.outputs.remaining }}" > cache/manifest.txt
+          gh release upload build-cache cache/manifest.txt --repo "$GITHUB_REPOSITORY" --clobber
+
+          # Clean up old generation parts
+          gh release view build-cache --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' \
+            | grep -E '^g[0-9]{3}-part-' | grep -v "^${tag}-" \
+            | while read -r stale; do
+                gh release delete-asset build-cache "$stale" --repo "$GITHUB_REPOSITORY" --yes >/dev/null
+              done || true
+          df -h /
+
+      # ─── Prepare release APK ───────────────────────────────────────────
+      - name: Prepare release APK
+        id: release
+        if: success() && inputs.action != 'probe'
+        run: |
+          set -eo pipefail
+          APK=$(find chromium/src/out/release \
+            -maxdepth 1 -type f -name '*x86_64.apk' -size +0c -print -quit)
+          if [ -z "$APK" ]; then
+            echo "::notice::No signed APK found; build may still be in progress"
+            echo "apk_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RELEASE_APK="${VERSION}-${{ env.unix_time }}-x86_64.apk"
+          cp "$APK" "$RELEASE_APK"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "RELEASE_APK=$RELEASE_APK" >> "$GITHUB_ENV"
+          echo "apk_found=true" >> "$GITHUB_OUTPUT"
+          echo "=== Ready for GitHub Release ==="
+          ls -lh "$RELEASE_APK"
+          sha256sum "$RELEASE_APK"
+
+      # ─── Publish release ───────────────────────────────────────────────
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        if: steps.release.outputs.apk_found == 'true'
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: v${{ env.VERSION }}
+          tag_name: v${{ env.VERSION }}
+          files: ${{ env.RELEASE_APK }}
+
+      # ─── Attest build provenance ───────────────────────────────────────
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        if: steps.release.outputs.apk_found == 'true'
+        with:
+          subject-path: ${{ env.RELEASE_APK }}
+
+      # ─── Report session outcome ────────────────────────────────────────
+      - name: Report session outcome
+        if: always()
+        run: |
+          set -euo pipefail
+          status='${{ steps.build.outputs.status }}'
+          if [ -z "$status" ]; then
+            if [ '${{ steps.restore.outputs.had_apk }}' = 'true' ]; then
+              echo "::notice::Restored tree already had APK; this session compiled nothing"
+              exit 0
+            fi
+            if [ '${{ inputs.action }}' = 'probe' ]; then
+              echo "Probe session: build step was skipped"
+              exit 0
+            fi
+            echo "::warning::Build step produced no status"
+            exit 0
+          fi
+          if [ "$status" = "0" ]; then
+            echo "Build completed successfully!"
+            exit 0
+          fi
+          if [ '${{ steps.progress.outputs.budget }}' = 'true' ]; then
+            echo "::notice::Session ended on time budget (${{ steps.build.outputs.seconds }}s); next session queued below"
+            exit 0
+          fi
+          echo "::error::Build failed with status $status after ${{ steps.build.outputs.seconds }}s. Cached tree preserved; fix the issue and re-run."
+          exit 1
+
+      # ─── Queue next session (auto-chain) ───────────────────────────────
+      - name: Queue next session
+        if: always() && steps.progress.outputs.budget == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Validate numeric inputs
+          for n in '${{ inputs.max_sessions }}' '${{ inputs.min_progress }}' '${{ inputs.build_minutes }}'; do
+            case "$n" in ''|*[!0-9]*) echo "::error::$n is not a valid number" >&2; exit 2 ;; esac
+          done
+
+          # Don't chain if APK already exists
+          if compgen -G "chromium/src/out/release/*.apk" >/dev/null; then
+            echo "APK exists; nothing left to queue"
+            exit 0
+          fi
+
+          if [ '${{ inputs.auto_chain }}' != "true" ]; then
+            echo "::notice::auto_chain=false; dispatch action=continue when ready for the next session"
+            exit 0
+          fi
+
+          # Check progress against minimum threshold
+          pending='${{ steps.progress.outputs.remaining }}'
+          previous='${{ steps.restore.outputs.pending }}'
+          if [ -n "$pending" ] && [ -n "$previous" ] && [ "$previous" -gt 0 ]; then
+            gained=$(( previous - pending ))
+            if [ "$gained" -lt '${{ inputs.min_progress }}' ]; then
+              echo "::error::Only cleared $gained of $previous pending targets — cache is not carrying work forward. Chain stopped."
+              exit 1
+            fi
+            echo "::notice::Progress: $previous → $pending pending targets ($gained cleared)"
+          fi
+
+          # Check session limit
+          gen='${{ steps.restore.outputs.generation }}'
+          next=$(( ${gen:-0} + 1 ))
+          if [ "$next" -gt '${{ inputs.max_sessions }}' ]; then
+            echo "::error::Stopped after $next sessions without APK; raise max_sessions or fix the build"
+            exit 1
+          fi
+
+          # Dispatch next session
+          gh workflow run build-cached.yml --repo "$GITHUB_REPOSITORY" \
+            -f action=continue \
+            -f runner='${{ inputs.runner }}' \
+            -f build_minutes='${{ inputs.build_minutes }}' \
+            -f auto_chain='${{ inputs.auto_chain }}' \
+            -f max_sessions='${{ inputs.max_sessions }}' \
+            -f min_progress='${{ inputs.min_progress }}'
+          echo "Queued session $next with action=continue"
+
+      # ─── Trigger VM deallocation (self-hosted only) ────────────────────
+      - name: Trigger VM deallocation
+        if: always() && (inputs.runner == 'self-hosted' || inputs.action == 'seed')
+        run: |
+          if [ -x /data/deallocate.sh ]; then
+            echo "Build session complete. Triggering VM deallocation."
+            /data/deallocate.sh 120
+          else
+            echo "Local /data/deallocate.sh not found; skipping VM deallocation."
+          fi
