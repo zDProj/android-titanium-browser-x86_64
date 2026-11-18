@@ -184,6 +184,7 @@ jobs:
             generation=$(sed -n 's/^generation=//p' cache/manifest.txt)
             parts=$(sed -n 's/^parts=//p' cache/manifest.txt)
             pending=$(sed -n 's/^remaining=//p' cache/manifest.txt)
+            seed_root=$(sed -n 's/^seed_root=//p' cache/manifest.txt)
             tag=$(printf 'g%03d' "$generation")
 
             recipe="${{ steps.recipe.outputs.fingerprint }}"
@@ -217,6 +218,46 @@ jobs:
               find cache -maxdepth 1 -name "${tag}-part-*" | sort | xargs cat \
                 | tar -I zstd -xf - -C "$GITHUB_WORKSPACE"
               rm -f cache/"${tag}"-part-*
+
+              # ── Make foreign build roots resolve ──────────────────────
+              # gn bakes a handful of absolute paths into the ninja graph
+              # (the pak resource allowlists). A tree cached on the
+              # self-hosted runner therefore points at
+              # /data/actions-runner/_work/<repo>/<repo>/chromium/src/out,
+              # which does not exist on a GitHub-hosted runner, so siso
+              # fails those actions with FileNotFoundError and the build
+              # stops with locales still pending. Instead of regenerating
+              # the graph (which would dirty every dependent action), link
+              # each foreign root at this workspace so the cached paths
+              # keep resolving. siso stores its own state relative to the
+              # build dir, so only the graph text is affected.
+              roots=$(
+                {
+                  printf '%s\n' "${seed_root:-}"
+                  find chromium/src/out/Default -maxdepth 1 -name '*.ninja' -type f -print0 2>/dev/null \
+                    | xargs -0 -r grep -ahoE '/[A-Za-z0-9._/-]+/chromium/src/out' || true
+                } | sed 's|/chromium/src/out$||' | sed '/^$/d' | sort -u
+              )
+              for root in $roots; do
+                if [ "$root" = "$GITHUB_WORKSPACE" ]; then
+                  continue
+                fi
+                case "$root" in
+                  /data/*|/home/*|/workspace/*|/mnt/*|/build/*) ;;
+                  *)
+                    echo "::notice::Ignoring unexpected cached root: $root"
+                    continue
+                    ;;
+                esac
+                if [ -e "$root" ] || [ -L "$root" ]; then
+                  echo "::notice::Cached root $root already exists; leaving it in place"
+                elif sudo -n mkdir -p "$(dirname "$root")" 2>/dev/null \
+                     && sudo -n ln -s "$GITHUB_WORKSPACE" "$root"; then
+                  echo "::notice::Linked cached root $root -> $GITHUB_WORKSPACE"
+                else
+                  echo "::warning::Could not link cached root $root; stale paths may fail the build"
+                fi
+              done
 
           # Never carry finished APK artifacts inside the cache: a restored
           # tree that contains one looks already-finished (had_apk=true) and
@@ -461,9 +502,9 @@ jobs:
 
           # Write manifest last — a half-uploaded generation is never advertised
           recipe="${{ steps.recipe.outputs.fingerprint }}"
-          printf 'generation=%d\nparts=%d\ncommit=%s\nrecipe=%s\nremaining=%s\n' \
+          printf 'generation=%d\nparts=%d\ncommit=%s\nrecipe=%s\nremaining=%s\nseed_root=%s\n' \
             "$generation" "$parts" "$GITHUB_SHA" "$recipe" \
-            "${{ steps.progress.outputs.remaining }}" > cache/manifest.txt
+            "${{ steps.progress.outputs.remaining }}" "$GITHUB_WORKSPACE" > cache/manifest.txt
           gh release upload build-cache cache/manifest.txt --repo "$GITHUB_REPOSITORY" --clobber
 
           # Clean up old generation parts
