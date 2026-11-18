@@ -255,18 +255,48 @@ jobs:
                      && sudo -n ln -s "$GITHUB_WORKSPACE" "$root"; then
                   echo "::notice::Linked cached root $root -> $GITHUB_WORKSPACE"
                 else
-                  echo "::warning::Could not link cached root $root; stale paths may fail the build"
+                  # Without passwordless sudo the root cannot be created, so
+                  # rewrite the stale absolute paths in the ninja graph. This
+                  # only invalidates the handful of actions that embed them.
+                  echo "::notice::Cannot link $root; rewriting graph paths instead"
+                  mapfile -t graph < <(
+                    grep -rlF "$root" chromium/src/out/Default --include='*.ninja' --include='*.rsp' 2>/dev/null || true
+                  )
+                  for f in "${graph[@]}"; do
+                    sed -i "s|$root|$GITHUB_WORKSPACE|g" "$f"
+                  done
+                  echo "::notice::Rewrote $root out of ${#graph[@]} graph file(s)"
                 fi
 
                 # Fail fast instead of 4+ hours into the compile: a cached
                 # root that does not resolve to the restored tree means the
                 # ninja graph still points outside the workspace.
-                if [ ! -e "$root/chromium/src/out/Default/build.ninja" ]; then
+                if [ -e "$root/chromium/src/out/Default/build.ninja" ]; then
+                  echo "::notice::Verified cached root $root"
+                elif [ -e chromium/src/out/Default/build.ninja ] \
+                     && ! grep -rqF "$root" chromium/src/out/Default --include='*.ninja' 2>/dev/null; then
+                  echo "::notice::Verified $root rewritten to $GITHUB_WORKSPACE"
+                else
                   echo "::error::Cached root $root does not resolve to the restored tree"
                   exit 1
                 fi
-                echo "::notice::Verified cached root $root"
               done
+
+              # Whatever route was used, no ninja file may still point at a
+              # build root outside the workspace that does not exist.
+              stale=$(
+                grep -hoE '/[A-Za-z0-9._/-]+/chromium/src/out' chromium/src/out/Default/*.ninja 2>/dev/null \
+                  | sed 's|/chromium/src/out$||' | sort -u \
+                  | while read -r r; do
+                      [ -z "$r" ] && continue
+                      [ -e "$r/chromium/src/out/Default/build.ninja" ] || printf '%s\n' "$r"
+                    done
+              )
+              if [ -n "$stale" ]; then
+                echo "::error::Unresolved cached build roots: $(printf '%s ' $stale)"
+                exit 1
+              fi
+              echo "::notice::All cached build roots resolve"
 
           # Never carry finished APK artifacts inside the cache: a restored
           # tree that contains one looks already-finished (had_apk=true) and
