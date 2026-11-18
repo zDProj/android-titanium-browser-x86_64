@@ -2,15 +2,38 @@ import os
 import pty
 import re
 import select
+import signal
 import sys
 
 ansi_escape = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 prog_re = re.compile(r"\[(\d+/\d+)\]([^\r\n]*)")
 
+child_pid = None
+
+
+def forward_signal(signum, frame):
+    """Relay timeout/runner signals to the whole build process group.
+
+    Without this, `timeout` in the workflow only interrupts this wrapper and
+    the job moves on to packaging the tree cache while ninja is still writing
+    to it.
+    """
+    if child_pid is not None:
+        try:
+            os.killpg(child_pid, signum)
+        except ProcessLookupError:
+            pass
+
+
 def run(cmd):
+    global child_pid
     pid, master_fd = pty.fork()
     if pid == 0:
         os.execvp(cmd[0], cmd)
+
+    child_pid = pid
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, forward_signal)
 
     buf = ""
     last_target = None
@@ -45,6 +68,7 @@ def run(cmd):
         os.close(master_fd)
 
     _, status = os.waitpid(pid, 0)
+    child_pid = None
     if buf:
         line_clean = ansi_escape.sub("", buf).replace("\r", "").strip()
         if line_clean:
@@ -56,6 +80,7 @@ def run(cmd):
     elif os.WIFSIGNALED(status):
         return 128 + os.WTERMSIG(status)
     return 1
+
 
 if __name__ == "__main__":
     cmd = sys.argv[1:] if len(sys.argv) > 1 else ["./build.sh"]

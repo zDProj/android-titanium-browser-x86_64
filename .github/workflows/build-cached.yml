@@ -25,7 +25,7 @@ on:
         description: 'Minutes of compilation budget per session (keep ≤ 300 for GitHub-hosted)'
         required: true
         type: string
-        default: '300'
+        default: '270'
       auto_chain:
         description: 'Automatically queue the next session if build is incomplete'
         required: true
@@ -257,6 +257,15 @@ jobs:
                 else
                   echo "::warning::Could not link cached root $root; stale paths may fail the build"
                 fi
+
+                # Fail fast instead of 4+ hours into the compile: a cached
+                # root that does not resolve to the restored tree means the
+                # ninja graph still points outside the workspace.
+                if [ ! -e "$root/chromium/src/out/Default/build.ninja" ]; then
+                  echo "::error::Cached root $root does not resolve to the restored tree"
+                  exit 1
+                fi
+                echo "::notice::Verified cached root $root"
               done
 
           # Never carry finished APK artifacts inside the cache: a restored
@@ -429,6 +438,50 @@ jobs:
             echo "value=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # ─── Prepare release APK ───────────────────────────────────────────
+      # Publish runs before the cache upload so a slow/aborted cache save can
+      # never cost us an APK that this session already built.
+      - name: Prepare release APK
+        id: release
+        if: always() && inputs.action != 'probe'
+        run: |
+          set -eo pipefail
+          APK=$(find chromium/src/out/release \
+            -maxdepth 1 -type f -name '*x86_64.apk' -size +0c -print -quit)
+          if [ -z "$APK" ]; then
+            echo "::notice::No signed APK found; build may still be in progress"
+            echo "apk_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RELEASE_APK="${VERSION}-${{ env.unix_time }}-x86_64.apk"
+          cp "$APK" "$RELEASE_APK"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "RELEASE_APK=$RELEASE_APK" >> "$GITHUB_ENV"
+          echo "apk_found=true" >> "$GITHUB_OUTPUT"
+          echo "=== Ready for GitHub Release ==="
+          ls -lh "$RELEASE_APK"
+          sha256sum "$RELEASE_APK"
+
+      # ─── Publish release ───────────────────────────────────────────────
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        if: steps.release.outputs.apk_found == 'true'
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: v${{ env.VERSION }}
+          tag_name: v${{ env.VERSION }}
+          files: ${{ env.RELEASE_APK }}
+
+      # ─── Attest build provenance ───────────────────────────────────────
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        if: steps.release.outputs.apk_found == 'true'
+        # Attestation is a nice-to-have; a transient failure must not mark a
+        # run that already published its APK as failed.
+        continue-on-error: true
+        with:
+          subject-path: ${{ env.RELEASE_APK }}
+
       # ─── Save build tree to GitHub Releases ────────────────────────────
       - name: Save build tree cache
         if: always() && inputs.action != 'probe'
@@ -516,45 +569,6 @@ jobs:
               done || true
           df -h /
 
-      # ─── Prepare release APK ───────────────────────────────────────────
-      - name: Prepare release APK
-        id: release
-        if: success() && inputs.action != 'probe'
-        run: |
-          set -eo pipefail
-          APK=$(find chromium/src/out/release \
-            -maxdepth 1 -type f -name '*x86_64.apk' -size +0c -print -quit)
-          if [ -z "$APK" ]; then
-            echo "::notice::No signed APK found; build may still be in progress"
-            echo "apk_found=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          RELEASE_APK="${VERSION}-${{ env.unix_time }}-x86_64.apk"
-          cp "$APK" "$RELEASE_APK"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "RELEASE_APK=$RELEASE_APK" >> "$GITHUB_ENV"
-          echo "apk_found=true" >> "$GITHUB_OUTPUT"
-          echo "=== Ready for GitHub Release ==="
-          ls -lh "$RELEASE_APK"
-          sha256sum "$RELEASE_APK"
-
-      # ─── Publish release ───────────────────────────────────────────────
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        if: steps.release.outputs.apk_found == 'true'
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          name: v${{ env.VERSION }}
-          tag_name: v${{ env.VERSION }}
-          files: ${{ env.RELEASE_APK }}
-
-      # ─── Attest build provenance ───────────────────────────────────────
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
-        if: steps.release.outputs.apk_found == 'true'
-        with:
-          subject-path: ${{ env.RELEASE_APK }}
-
       # ─── Report session outcome ────────────────────────────────────────
       - name: Report session outcome
         if: always()
@@ -611,9 +625,12 @@ jobs:
           # Check progress against minimum threshold
           pending='${{ steps.progress.outputs.remaining }}'
           previous='${{ steps.restore.outputs.pending }}'
+          # Only enforce the threshold while there is more work queued than the
+          # threshold itself; a late-stage session with a few hundred targets
+          # left must still be allowed to chain.
           if [ -n "$pending" ] && [ -n "$previous" ] && [ "$previous" -gt 0 ]; then
             gained=$(( previous - pending ))
-            if [ "$gained" -lt '${{ inputs.min_progress }}' ]; then
+            if [ "$previous" -gt '${{ inputs.min_progress }}' ] && [ "$gained" -lt '${{ inputs.min_progress }}' ]; then
               echo "::error::Only cleared $gained of $previous pending targets — cache is not carrying work forward. Chain stopped."
               exit 1
             fi
