@@ -65,8 +65,12 @@ if [ "$resume_tree" = "0" ]; then
     git init
     git remote get-url origin >/dev/null 2>&1 || git remote add origin $CHROMIUM_SOURCE
     if ! git rev-parse --verify main >/dev/null 2>&1; then
-      git fetch --depth 1 $CHROMIUM_SOURCE +refs/tags/$VERSION:chromium_$VERSION
-      git checkout $VERSION
+      # Fetch the tag into a local tag and create main at that commit.
+      # Checking out the bare tag leaves a detached HEAD, which makes the
+      # `git branch -M main` below (and every later git call) fail on a cold
+      # tree. Explicit refspecs also avoid git's DWIM creating refs/heads/*.
+      git fetch --depth 1 $CHROMIUM_SOURCE "+refs/tags/$VERSION:refs/tags/$VERSION"
+      git checkout -B main "$VERSION"
       cp $SCRIPT_DIR/.gclient ../.gclient
 
       # https://grapheneos.org/build#browser-and-webview
@@ -83,7 +87,6 @@ if [ "$resume_tree" = "0" ]; then
       git config --global user.email "titanium-build@localhost"
       git config --global user.name "Titanium Build"
       git am --whitespace=nowarn --keep-non-patch $SCRIPT_DIR/vanadium/patches/*.patch
-      git branch -M main
     fi
 
     gclient sync -D --no-history --nohooks

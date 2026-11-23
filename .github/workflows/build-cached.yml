@@ -476,8 +476,11 @@ jobs:
         if: always() && inputs.action != 'probe'
         run: |
           set -eo pipefail
+          # out/release does not exist yet when a cold build fails before
+          # gn gen; a missing directory must not fail this step.
+          mkdir -p chromium/src/out/release
           APK=$(find chromium/src/out/release \
-            -maxdepth 1 -type f -name '*x86_64.apk' -size +0c -print -quit)
+            -maxdepth 1 -type f -name '*x86_64.apk' -size +0c -print -quit 2>/dev/null || true)
           if [ -z "$APK" ]; then
             echo "::notice::No signed APK found; build may still be in progress"
             echo "apk_found=false" >> "$GITHUB_OUTPUT"
