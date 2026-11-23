@@ -12,13 +12,14 @@ on:
           - self-hosted
         default: 'ubuntu-latest'
       action:
-        description: 'Build action: continue (resume from cache), reset (fresh build), seed (self-hosted cache fill), probe (inspect cache only)'
+        description: 'Build action: continue (resume from cache), reset (fresh build), seed (self-hosted cache fill), preflight (prepare sources + gn gen only), probe (inspect cache only)'
         required: true
         type: choice
         options:
           - continue
           - reset
           - seed
+          - preflight
           - probe
         default: continue
       build_minutes:
@@ -147,7 +148,7 @@ jobs:
       # ─── Restore build tree from GitHub Releases ───────────────────────
       - name: Restore build tree cache
         id: restore
-        if: inputs.action == 'continue' || inputs.action == 'probe' || inputs.action == 'seed'
+        if: inputs.action == 'continue' || inputs.action == 'probe' || inputs.action == 'seed' || inputs.action == 'preflight'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -167,7 +168,9 @@ jobs:
           }
 
           generation=0
+          maxgen=0
           pending=''
+          upgrade=false
 
           if gh release view build-cache --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             mkdir -p cache
@@ -177,27 +180,95 @@ jobs:
             if [ ! -f cache/manifest.txt ]; then
               echo "::notice::No manifest in build-cache release; starting cold"
               echo "generation=0" >> "$GITHUB_OUTPUT"
+              echo "maxgen=0" >> "$GITHUB_OUTPUT"
+              echo "upgrade=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
-            cached_recipe=$(sed -n 's/^recipe=//p' cache/manifest.txt)
-            generation=$(sed -n 's/^generation=//p' cache/manifest.txt)
-            parts=$(sed -n 's/^parts=//p' cache/manifest.txt)
-            pending=$(sed -n 's/^remaining=//p' cache/manifest.txt)
-            seed_root=$(sed -n 's/^seed_root=//p' cache/manifest.txt)
-            tag=$(printf 'g%03d' "$generation")
-
+            latest_gen=$(sed -n 's/^generation=//p' cache/manifest.txt)
+            case "${latest_gen:-0}" in ''|*[!0-9]*) latest_gen=0 ;; esac
+            latest_tag=$(printf 'g%03d' "$latest_gen")
             recipe="${{ steps.recipe.outputs.fingerprint }}"
+            assets=$(gh release view build-cache --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+
+            maxgen=$(printf '%s\n' "$assets" \
+              | sed -n 's/^g\([0-9]\{3\}\).*/\1/p' | sort -n | tail -1 || true)
+            maxgen=$((10#${maxgen:-0}))
+            [ "$maxgen" -ge "${latest_gen:-0}" ] || maxgen=${latest_gen:-0}
+
+            # One record per generation, newest first:
+            #   <tag> <parts> <recipe> <version> <remaining> <apk>
+            # .meta assets are written after a generation is fully uploaded, so
+            # a record here always describes a complete generation.
+            records=''
+            for meta in $(printf '%s\n' "$assets" | grep -E '^g[0-9]{3}\.meta$' || true); do
+              retry gh release download build-cache --repo "$GITHUB_REPOSITORY" \
+                --pattern "$meta" --dir cache --clobber || continue
+              records="${records}$(printf '%s %s %s %s %s %s' "${meta%.meta}" \
+                "$(sed -n 's/^parts=//p' "cache/$meta")" \
+                "$(sed -n 's/^recipe=//p' "cache/$meta" | sed 's/^$/none/')" \
+                "$(sed -n 's/^version=//p' "cache/$meta")" \
+                "$(sed -n 's/^remaining=//p' "cache/$meta")" \
+                "$(sed -n 's/^apk=//p' "cache/$meta")")"$'\n'
+            done
+            # The advertised manifest is authoritative for its own generation
+            # (also covers generations saved before .meta assets existed).
+            manifest_record=$(printf '%s %s %s %s %s %s' "$latest_tag" \
+              "$(sed -n 's/^parts=//p' cache/manifest.txt)" \
+              "$(sed -n 's/^recipe=//p' cache/manifest.txt | sed 's/^$/none/')" \
+              "$(sed -n 's/^version=//p' cache/manifest.txt)" \
+              "$(sed -n 's/^remaining=//p' cache/manifest.txt)" \
+              "$(sed -n 's/^apk=//p' cache/manifest.txt)")
+            records=$(printf '%s\n%s\n' \
+              "$(printf '%s' "$records" | grep -v "^${latest_tag} " || true)" \
+              "$manifest_record")
+            seed_root=$(sed -n 's/^seed_root=//p' cache/manifest.txt)
+
+            # Pick the tree that best matches this build:
+            #   1. same recipe  -> plain resume, skip fetch/patches
+            #   2. same version -> re-apply patches on the same sources
+            #   3. any tree     -> cross-version upgrade, objects kept
+            chosen=''
+            mode=''
+            for want in recipe version any; do
+              while read -r t n r v p a; do
+                [ -n "$t" ] || continue
+                case "$want" in
+                  recipe) [ "$r" = "$recipe" ] || [ "$r" = "none" ] || continue ;;
+                  version) [ -n "$v" ] && [ "$v" = "$VERSION" ] || continue ;;
+                esac
+                chosen=$t; parts=$n; pending=$p; cached_recipe=$r; cached_version=$v
+                mode=$want
+                break
+              done <<< "$(printf '%s' "$records" | sort -r)"
+              if [ -n "$chosen" ]; then break; fi
+            done
 
             restore=false
-            if [ -z "$cached_recipe" ]; then
-              echo "::warning::$tag has no recipe fingerprint; resuming anyway"
-              restore=true
-            elif [ "$cached_recipe" = "$recipe" ]; then
-              restore=true
-            else
-              echo "::notice::$tag was built from recipe $cached_recipe, current is $recipe; starting cold"
+            if [ -n "$chosen" ] && [ "${parts:-0}" -lt 1 ]; then
+              echo "::warning::$chosen has no recorded part count; starting cold"
+              chosen=''
+            fi
+            if [ -z "$chosen" ]; then
+              echo "::notice::No usable cached generation; starting cold"
               pending=''
+            else
+              restore=true
+              tag=$chosen
+              generation=$((10#${chosen#g}))
+              parts=${parts:-0}
+              if [ "$mode" = "recipe" ]; then
+                echo "::notice::$tag matches the current recipe (${cached_version:-unknown}) — resuming"
+              else
+                # The tree no longer matches (new Chromium tag, patch.sh,
+                # .gclient or vanadium SHA). Discarding it would force a cold
+                # rebuild from zero; instead restore it and let build.sh fetch
+                # the new tag and re-apply the patches on top, so third_party
+                # checkouts and out/Default objects survive the upgrade.
+                upgrade=true
+                pending=''
+                echo "::notice::$tag is ${cached_version:-unknown} (recipe ${cached_recipe:-unknown}), building $VERSION — restoring for in-place upgrade"
+              fi
             fi
 
             if [ "$restore" = "true" ]; then
@@ -310,7 +381,9 @@ jobs:
           fi
 
           echo "generation=$generation" >> "$GITHUB_OUTPUT"
+          echo "maxgen=$maxgen" >> "$GITHUB_OUTPUT"
           echo "pending=${pending:-}" >> "$GITHUB_OUTPUT"
+          echo "upgrade=$upgrade" >> "$GITHUB_OUTPUT"
 
           if compgen -G "chromium/src/out/release/*.apk" >/dev/null; then
             echo "had_apk=true" >> "$GITHUB_OUTPUT"
@@ -329,7 +402,8 @@ jobs:
           nlog=$outdir/.ninja_log
           rows=$( [ -f "$nlog" ] && wc -l < "$nlog" || echo absent )
           prepared=$( [ -f "$outdir/.titanium-prepared" ] && echo yes || echo no )
-          echo "::notice::probe objects=$objects ninjaLogRows=$rows prepared=$prepared"
+          marker=$(tr '\n' ' ' < "$outdir/.titanium-prepared" 2>/dev/null || true)
+          echo "::notice::probe objects=$objects ninjaLogRows=$rows prepared=$prepared marker=${marker:-none}"
           du -sh "$outdir" 2>/dev/null
           echo "=== ccache stats ==="
           ccache -s 2>/dev/null || echo "ccache not available"
@@ -359,7 +433,9 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
           LOCAL_TEST_JKS: ${{ secrets.LOCAL_TEST_JKS }}
           STORE_TEST_JKS: ${{ secrets.STORE_TEST_JKS }}
-          RESUME: ${{ (inputs.action == 'continue' || inputs.action == 'seed') && '1' || '0' }}
+          RESUME: ${{ (inputs.action == 'continue' || inputs.action == 'seed' || inputs.action == 'preflight') && '1' || '0' }}
+          UPGRADE_CACHE: ${{ steps.restore.outputs.upgrade == 'true' && '1' || '0' }}
+          PREFLIGHT: ${{ inputs.action == 'preflight' && '1' || '0' }}
         run: |
           # Mark cache for saving even if build is interrupted
           echo "save_cache=true" >> "$GITHUB_OUTPUT"
@@ -551,7 +627,7 @@ jobs:
             exit 0
           fi
 
-          previous='${{ steps.restore.outputs.generation }}'
+          previous='${{ steps.restore.outputs.maxgen }}'
           generation=$(( ${previous:-0} + 1 ))
           tag=$(printf 'g%03d' "$generation")
           rm -rf cache; mkdir -p cache
@@ -588,17 +664,62 @@ jobs:
 
           # Write manifest last — a half-uploaded generation is never advertised
           recipe="${{ steps.recipe.outputs.fingerprint }}"
-          printf 'generation=%d\nparts=%d\ncommit=%s\nrecipe=%s\nremaining=%s\nseed_root=%s\n' \
-            "$generation" "$parts" "$GITHUB_SHA" "$recipe" \
+          if [ '${{ steps.release.outputs.apk_found }}' = 'true' ]; then
+            apk="${RELEASE_APK:-}"
+          else
+            apk=''
+          fi
+          printf 'generation=%d\nparts=%d\ncommit=%s\nrecipe=%s\nversion=%s\napk=%s\nremaining=%s\nseed_root=%s\n' \
+            "$generation" "$parts" "$GITHUB_SHA" "$recipe" "$VERSION" "$apk" \
             "${{ steps.progress.outputs.remaining }}" "$GITHUB_WORKSPACE" > cache/manifest.txt
           gh release upload build-cache cache/manifest.txt --repo "$GITHUB_REPOSITORY" --clobber
+          # Per-generation metadata outlives the single manifest.txt, so a
+          # later session can tell which generation last produced an APK.
+          # Upload it last: a .meta asset therefore always means "complete".
+          cp cache/manifest.txt "cache/${tag}.meta"
+          retry gh release upload build-cache "cache/${tag}.meta" --repo "$GITHUB_REPOSITORY" --clobber \
+            || echo "::warning::Could not upload ${tag}.meta; retention falls back to the newest generation"
 
-          # Clean up old generation parts
-          gh release view build-cache --repo "$GITHUB_REPOSITORY" --json assets \
-            --jq '.assets[].name' \
-            | grep -E '^g[0-9]{3}-part-' | grep -v "^${tag}-" \
+          # Retention. A published APK makes this generation known-good, so all
+          # older trees can go. Otherwise keep this generation plus the newest
+          # known-good one (or, if none is marked, the newest other), so an
+          # upgrade in progress never destroys the last working tree.
+          assets=$(gh release view build-cache --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          if [ -n "$apk" ]; then
+            echo "::notice::$tag published an APK; pruning every older generation"
+            keep_pattern="^${tag}(-part-|\.meta\$)"
+          else
+            keep_good=''
+            for meta in $(printf '%s\n' "$assets" | grep -E '^g[0-9]{3}\.meta$' || true); do
+              old=${meta%.meta}
+              [ "$old" = "$tag" ] && continue
+              gh release download build-cache --pattern "$meta" --dir cache --clobber >/dev/null 2>&1 || continue
+              if grep -q '^apk=.' "cache/$meta"; then
+                keep_good=$old
+              fi
+            done
+            if [ -z "$keep_good" ]; then
+              # Compatibility with generations saved before .meta assets
+              # existed (and with partial chains): fall back to the newest
+              # other generation.
+              keep_good=$(printf '%s\n' "$assets" | grep -E '^g[0-9]{3}-part-' | cut -d- -f1 | grep -vx "$tag" | sort -u | tail -1 || true)
+              echo "::notice::No generation recorded with a published APK; keeping newest other generation ${keep_good:-none}"
+            else
+              echo "::notice::Keeping last known-good generation $keep_good alongside $tag"
+            fi
+            if [ -n "$keep_good" ]; then
+              keep_pattern="^(${tag}|${keep_good})(-part-|\.meta\$)"
+            else
+              keep_pattern="^${tag}(-part-|\.meta\$)"
+            fi
+          fi
+
+          # Delete every generation that is neither the new one nor the keeper
+          printf '%s\n' "$assets" \
+            | grep -E '^g[0-9]{3}(-part-|\.meta$)' | grep -Ev "$keep_pattern" \
             | while read -r stale; do
-                gh release delete-asset build-cache "$stale" --repo "$GITHUB_REPOSITORY" --yes >/dev/null
+                echo "Deleting old cache asset $stale"
+                gh release delete-asset build-cache "$stale" --repo "$GITHUB_REPOSITORY" --yes >/dev/null || true
               done || true
           df -h /
 
@@ -671,7 +792,7 @@ jobs:
           fi
 
           # Check session limit
-          gen='${{ steps.restore.outputs.generation }}'
+          gen='${{ steps.restore.outputs.maxgen }}'
           next=$(( ${gen:-0} + 1 ))
           if [ "$next" -gt '${{ inputs.max_sessions }}' ]; then
             echo "::error::Stopped after $next sessions without APK; raise max_sessions or fix the build"

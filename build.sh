@@ -55,46 +55,106 @@ export PATH="$PWD/depot_tools:$PATH"
 # ─── Chromium source ─────────────────────────────────────────────────
 mkdir -p chromium/src/out/Default; cd chromium/src
 
+marker=out/Default/.titanium-prepared
+prepared_version=''
+if [ -f "$marker" ]; then
+    prepared_version=$(sed -n 's/^version=//p' "$marker" | head -1)
+fi
+
+write_marker() {
+    # Record what this tree actually contains so a later session can tell a
+    # resume (same version) from an upgrade (new version).
+    printf 'version=%s\nvanadium=%s\nbuilt=%s\n' \
+        "$VERSION" \
+        "$(git -C "$SCRIPT_DIR/vanadium" rev-parse HEAD 2>/dev/null || echo unknown)" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker"
+}
+
+apply_patch_series() {
+    # https://grapheneos.org/build#browser-and-webview
+    rm -rf $SCRIPT_DIR/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
+    rm -rf $SCRIPT_DIR/vanadium/patches/*{detailed,supported}-language*.patch
+    rm -rf $SCRIPT_DIR/vanadium/patches/*javascript-optimizer-{site-setting,settings-UI}.patch
+    rm -rf $SCRIPT_DIR/vanadium/patches/*component-updates.patch
+    rm -rf $SCRIPT_DIR/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button,configs-from-config-app,config-app-parsing,new-tab-card,predictive-back}*.patch
+    # rm -rf $SCRIPT_DIR/vanadium/patches/*crashpad*.patch
+    replace "$SCRIPT_DIR/vanadium/patches" "VANADIUM" "TITANIUM"
+    replace "$SCRIPT_DIR/vanadium/patches" "Vanadium" "Titanium"
+    replace "$SCRIPT_DIR/vanadium/patches" "vanadium" "titanium"
+
+    git config --global user.email "titanium-build@localhost"
+    git config --global user.name "Titanium Build"
+
+    # Apply one patch at a time so a failure names the offending patch
+    # instead of surfacing as a bare `git am` exit code.
+    local p
+    for p in $SCRIPT_DIR/vanadium/patches/*.patch; do
+        if ! git am --whitespace=nowarn --keep-non-patch "$p"; then
+            echo "::error::Failed to apply patch $(basename "$p") on $VERSION" >&2
+            git am --abort >/dev/null 2>&1 || true
+            return 1
+        fi
+    done
+}
+
 resume_tree=0
-if [ "$RESUME" = "1" ] && [ -f out/Default/.titanium-prepared ]; then
-    resume_tree=1
-    echo "::notice::Resuming cached checkout — skipping fetch, patches, and runhooks"
+upgrade_tree=0
+if [ "$RESUME" = "1" ] && [ -f "$marker" ]; then
+    if [ "${UPGRADE_CACHE:-0}" = "1" ]; then
+        # The workflow decided this cached tree no longer matches the recipe
+        # (new Chromium version, patch.sh change, ...). Re-fetch sources but
+        # keep third_party checkouts and out/Default objects.
+        upgrade_tree=1
+        echo "::notice::Upgrading cached tree (${prepared_version:-unknown} -> $VERSION) in place; build objects kept"
+    elif [ -z "$prepared_version" ] || [ "$prepared_version" = "$VERSION" ]; then
+        # An empty version means a tree cached by an older build.sh; the
+        # recipe fingerprint already guards correctness, so accept it.
+        resume_tree=1
+        echo "::notice::Resuming cached checkout ($VERSION) — skipping fetch, patches, and runhooks"
+    else
+        echo "::warning::Cached tree is $prepared_version but building $VERSION and UPGRADE_CACHE is off — starting cold"
+    fi
 fi
 
 if [ "$resume_tree" = "0" ]; then
-    git init
-    git remote get-url origin >/dev/null 2>&1 || git remote add origin $CHROMIUM_SOURCE
-    if ! git rev-parse --verify main >/dev/null 2>&1; then
-      # Fetch the tag into a local tag and create main at that commit.
-      # Checking out the bare tag leaves a detached HEAD, which makes the
-      # `git branch -M main` below (and every later git call) fail on a cold
-      # tree. Explicit refspecs also avoid git's DWIM creating refs/heads/*.
-      git fetch --depth 1 $CHROMIUM_SOURCE "+refs/tags/$VERSION:refs/tags/$VERSION"
-      git checkout -B main "$VERSION"
-      cp $SCRIPT_DIR/.gclient ../.gclient
+    # A previous session may have been interrupted inside `git am`; that
+    # leaves a rebase state which blocks both checkout and `git am`.
+    git am --abort >/dev/null 2>&1 || true
+    git rebase --abort >/dev/null 2>&1 || true
 
-      # https://grapheneos.org/build#browser-and-webview
-      rm -rf $SCRIPT_DIR/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
-      rm -rf $SCRIPT_DIR/vanadium/patches/*{detailed,supported}-language*.patch
-      rm -rf $SCRIPT_DIR/vanadium/patches/*javascript-optimizer-{site-setting,settings-UI}.patch
-      rm -rf $SCRIPT_DIR/vanadium/patches/*component-updates.patch
-      rm -rf $SCRIPT_DIR/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button,configs-from-config-app,config-app-parsing,new-tab-card,predictive-back}*.patch
-      # rm -rf $SCRIPT_DIR/vanadium/patches/*crashpad*.patch
-      replace "$SCRIPT_DIR/vanadium/patches" "VANADIUM" "TITANIUM"
-      replace "$SCRIPT_DIR/vanadium/patches" "Vanadium" "Titanium"
-      replace "$SCRIPT_DIR/vanadium/patches" "vanadium" "titanium"
+    if [ "$upgrade_tree" = "1" ]; then
+        # Upgrade path: same steps as a cold checkout, but on top of the
+        # cached tree so third_party checkouts and out/Default objects stay.
+        # -f: a new Chromium version may add files that the old tree has as
+        # untracked leftovers; they are recreated by gclient sync anyway.
+        git checkout . >/dev/null 2>&1 || true
+        git fetch --depth 1 $CHROMIUM_SOURCE "+refs/tags/$VERSION:refs/tags/$VERSION"
+        git checkout -f -B main "$VERSION"
+        cp $SCRIPT_DIR/.gclient ../.gclient
+        apply_patch_series
+    else
+        git init
+        git remote get-url origin >/dev/null 2>&1 || git remote add origin $CHROMIUM_SOURCE
 
-      git config --global user.email "titanium-build@localhost"
-      git config --global user.name "Titanium Build"
-      git am --whitespace=nowarn --keep-non-patch $SCRIPT_DIR/vanadium/patches/*.patch
+        head_version=$(git describe --tags --abbrev=0 2>/dev/null || true)
+        if ! git rev-parse --verify main >/dev/null 2>&1 || [ "$head_version" != "$VERSION" ]; then
+          if [ -n "$head_version" ] && [ "$head_version" != "$VERSION" ]; then
+            echo "::warning::Existing checkout is $head_version, not $VERSION; replacing sources"
+          fi
+          # Fetch the tag into a local tag and create main at that commit.
+          # Checking out the bare tag leaves a detached HEAD, which makes
+          # every later git call fail on a cold tree. Explicit refspecs also
+          # avoid git's DWIM creating refs/heads/*.
+          git fetch --depth 1 $CHROMIUM_SOURCE "+refs/tags/$VERSION:refs/tags/$VERSION"
+          git checkout -f -B main "$VERSION"
+          cp $SCRIPT_DIR/.gclient ../.gclient
+          apply_patch_series
+        fi
     fi
 
     gclient sync -D --no-history --nohooks
     gclient runhooks
     ./build/install-build-deps.sh --no-prompt
-
-    # Mark tree as prepared for future resume
-    : > out/Default/.titanium-prepared
 else
     # Bootstrap depot_tools on resumed tree
     if [ -x "$SCRIPT_DIR/depot_tools/ensure_bootstrap" ]; then
@@ -105,6 +165,12 @@ else
 
     # Still need build deps on a fresh runner
     ./build/install-build-deps.sh --no-prompt
+fi
+
+if [ "$resume_tree" = "0" ]; then
+    # Mark the tree as prepared for future resumes and record which version
+    # the sources now contain, so a later session can tell resume from upgrade.
+    write_marker
 fi
 
 # ─── Clang version for ccache ────────────────────────────────────────
@@ -147,6 +213,15 @@ if [ -n "$TC_FILE" ]; then
     else
         grep -m1 -E 'command = .*ccache' "$TC_FILE" | cut -c1-220
     fi
+fi
+
+# ─── Preflight stop (no compile) ─────────────────────────────────────
+# Exercises the expensive-to-debug part of an upgrade — tag fetch, patch
+# series, gclient sync, gn gen — in ~20 minutes instead of discovering a
+# break deep inside a multi-hour compile session.
+if [ "${PREFLIGHT:-0}" = "1" ]; then
+    echo "::notice::Preflight OK: $VERSION sources, patches and gn gen succeeded; skipping compile"
+    exit 0
 fi
 
 # ─── System info before compile ──────────────────────────────────────
