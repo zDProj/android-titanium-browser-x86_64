@@ -272,23 +272,27 @@ jobs:
             fi
 
             if [ "$restore" = "true" ]; then
-              echo "Restoring $tag ($parts parts)..."
-              for p in $(seq -f '%03g' 0 $((parts - 1))); do
-                while [ ! -s "cache/${tag}-part-${p}" ]; do
-                  retry gh release download build-cache --repo "$GITHUB_REPOSITORY" \
-                    --pattern "${tag}-part-${p}" --dir cache --clobber
+              if [ -d chromium/src/out/Default ] && [ -n "$(find chromium/src/out/Default -name '*.o' -print -quit 2>/dev/null)" ]; then
+                echo "::notice::Build tree already present on local disk with intermediate objects ($(find chromium/src/out -name '*.o' 2>/dev/null | wc -l) objects); skipping network download"
+              else
+                echo "Restoring $tag ($parts parts)..."
+                for p in $(seq -f '%03g' 0 $((parts - 1))); do
+                  while [ ! -s "cache/${tag}-part-${p}" ]; do
+                    retry gh release download build-cache --repo "$GITHUB_REPOSITORY" \
+                      --pattern "${tag}-part-${p}" --dir cache --clobber
+                  done
                 done
-              done
 
-              found=$(find cache -maxdepth 1 -name "${tag}-part-*" | wc -l)
-              if [ "$found" -ne "$parts" ]; then
-                echo "::error::Cache generation $tag incomplete: $found of $parts parts"
-                exit 1
+                found=$(find cache -maxdepth 1 -name "${tag}-part-*" | wc -l)
+                if [ "$found" -ne "$parts" ]; then
+                  echo "::error::Cache generation $tag incomplete: $found of $parts parts"
+                  exit 1
+                fi
+
+                find cache -maxdepth 1 -name "${tag}-part-*" | sort | xargs cat \
+                  | tar -I zstd -xf - -C "$GITHUB_WORKSPACE"
+                rm -f cache/"${tag}"-part-*
               fi
-
-              find cache -maxdepth 1 -name "${tag}-part-*" | sort | xargs cat \
-                | tar -I zstd -xf - -C "$GITHUB_WORKSPACE"
-              rm -f cache/"${tag}"-part-*
 
               # ── Make foreign build roots resolve ──────────────────────
               # gn bakes a handful of absolute paths into the ninja graph
@@ -635,10 +639,10 @@ jobs:
           echo "::notice::Caching tree: objects=$(find chromium/src/out -name '*.o' 2>/dev/null | wc -l)"
 
           # PAX format preserves sub-second mtimes so siso doesn't consider
-          # restored objects stale (critical for incremental build correctness)
-          tar --format=pax --exclude='chromium/src/out/release/*.apk' -I 'zstd -1 -T0' -cf cache/tree.tar.zst chromium
-          split -b 1500M -d -a 3 cache/tree.tar.zst "cache/${tag}-part-"
-          rm -f cache/tree.tar.zst
+          # restored objects stale (critical for incremental build correctness).
+          # Stream tar directly into split to avoid writing a duplicate 30GB un-split file.
+          tar --format=pax --exclude='chromium/src/out/release/*.apk' -I 'zstd -1 -T0' -cf - chromium \
+            | split -b 1500M -d -a 3 - "cache/${tag}-part-"
           parts=$(find cache -maxdepth 1 -name "${tag}-part-*" | wc -l)
           echo "Cache ${tag}: ${parts} parts, $(du -sh cache | cut -f1)"
 
@@ -657,9 +661,10 @@ jobs:
                 gh release delete-asset build-cache "$old" --repo "$GITHUB_REPOSITORY" --yes >/dev/null
               done || true
 
-          # Upload new parts
+          # Upload new parts and delete each locally once uploaded to free disk space
           for f in cache/"${tag}"-part-*; do
             retry gh release upload build-cache "$f" --repo "$GITHUB_REPOSITORY" --clobber
+            rm -f "$f"
           done
 
           # Write manifest last — a half-uploaded generation is never advertised

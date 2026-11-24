@@ -123,6 +123,7 @@ if [ "$RESUME" = "1" ] && [ -d out/Default ]; then
 fi
 
 if [ "$resume_tree" = "0" ]; then
+    rm -f "$marker"
     # A previous session may have been interrupted inside `git am`; that
     # leaves a rebase state which blocks both checkout and `git am`.
     git am --abort >/dev/null 2>&1 || true
