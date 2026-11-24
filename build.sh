@@ -85,6 +85,11 @@ apply_patch_series() {
     git config --global user.email "titanium-build@localhost"
     git config --global user.name "Titanium Build"
 
+    # Ensure no leftover rebase or am directory exists before starting
+    git am --abort >/dev/null 2>&1 || true
+    git rebase --abort >/dev/null 2>&1 || true
+    rm -rf .git/rebase-apply .git/rebase-merge
+
     # Apply one patch at a time so a failure names the offending patch
     # instead of surfacing as a bare `git am` exit code.
     local p
@@ -92,6 +97,7 @@ apply_patch_series() {
         if ! git am --whitespace=nowarn --keep-non-patch "$p"; then
             echo "::error::Failed to apply patch $(basename "$p") on $VERSION" >&2
             git am --abort >/dev/null 2>&1 || true
+            rm -rf .git/rebase-apply .git/rebase-merge
             return 1
         fi
     done
@@ -99,20 +105,20 @@ apply_patch_series() {
 
 resume_tree=0
 upgrade_tree=0
-if [ "$RESUME" = "1" ] && [ -f "$marker" ]; then
+if [ "$RESUME" = "1" ] && [ -d out/Default ]; then
     if [ "${UPGRADE_CACHE:-0}" = "1" ]; then
         # The workflow decided this cached tree no longer matches the recipe
         # (new Chromium version, patch.sh change, ...). Re-fetch sources but
         # keep third_party checkouts and out/Default objects.
         upgrade_tree=1
         echo "::notice::Upgrading cached tree (${prepared_version:-unknown} -> $VERSION) in place; build objects kept"
-    elif [ -z "$prepared_version" ] || [ "$prepared_version" = "$VERSION" ]; then
-        # An empty version means a tree cached by an older build.sh; the
-        # recipe fingerprint already guards correctness, so accept it.
+    elif [ -n "$prepared_version" ] && [ "$prepared_version" = "$VERSION" ]; then
+        # An exact version match with a prepared marker resumes directly.
         resume_tree=1
         echo "::notice::Resuming cached checkout ($VERSION) — skipping fetch, patches, and runhooks"
     else
-        echo "::warning::Cached tree is $prepared_version but building $VERSION and UPGRADE_CACHE is off — starting cold"
+        upgrade_tree=1
+        echo "::notice::Cached tree version (${prepared_version:-unknown}) does not match $VERSION — upgrading in place"
     fi
 fi
 
@@ -121,6 +127,8 @@ if [ "$resume_tree" = "0" ]; then
     # leaves a rebase state which blocks both checkout and `git am`.
     git am --abort >/dev/null 2>&1 || true
     git rebase --abort >/dev/null 2>&1 || true
+    rm -rf .git/rebase-apply .git/rebase-merge
+    git reset --hard >/dev/null 2>&1 || true
 
     if [ "$upgrade_tree" = "1" ]; then
         # Upgrade path: same steps as a cold checkout, but on top of the
@@ -128,6 +136,7 @@ if [ "$resume_tree" = "0" ]; then
         # -f: a new Chromium version may add files that the old tree has as
         # untracked leftovers; they are recreated by gclient sync anyway.
         git checkout . >/dev/null 2>&1 || true
+        git clean -fd >/dev/null 2>&1 || true
         git fetch --depth 1 $CHROMIUM_SOURCE "+refs/tags/$VERSION:refs/tags/$VERSION"
         git checkout -f -B main "$VERSION"
         cp $SCRIPT_DIR/.gclient ../.gclient
@@ -135,6 +144,10 @@ if [ "$resume_tree" = "0" ]; then
     else
         git init
         git remote get-url origin >/dev/null 2>&1 || git remote add origin $CHROMIUM_SOURCE
+        git am --abort >/dev/null 2>&1 || true
+        git rebase --abort >/dev/null 2>&1 || true
+        rm -rf .git/rebase-apply .git/rebase-merge
+        git reset --hard >/dev/null 2>&1 || true
 
         head_version=$(git describe --tags --abbrev=0 2>/dev/null || true)
         if ! git rev-parse --verify main >/dev/null 2>&1 || [ "$head_version" != "$VERSION" ]; then

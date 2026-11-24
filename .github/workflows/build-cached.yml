@@ -811,10 +811,10 @@ jobs:
 
       # ─── Trigger VM deallocation (self-hosted only) ────────────────────
       - name: Trigger VM deallocation
-        if: always() && (inputs.runner == 'self-hosted' || inputs.action == 'seed')
+        if: steps.hasapk.outputs.value == 'true' && (inputs.runner == 'self-hosted' || inputs.action == 'seed')
         run: |
           if [ -x /data/deallocate.sh ]; then
-            echo "Build session complete. Triggering VM deallocation."
+            echo "Build session complete with APK. Triggering VM deallocation in 120s."
             /data/deallocate.sh 120
           else
             echo "Local /data/deallocate.sh not found; skipping VM deallocation."
