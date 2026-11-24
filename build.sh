@@ -165,6 +165,10 @@ if [ "$resume_tree" = "0" ]; then
         fi
     fi
 
+    # Reset any dirty subprojects in third_party (e.g. from previous runs of patch.sh)
+    # so gclient sync will not fail with "You have uncommitted changes".
+    find third_party -maxdepth 5 -name ".git" -type d -execdir git reset --hard HEAD \; -execdir git clean -fd \; 2>/dev/null || true
+
     gclient sync -D --no-history --nohooks
     gclient runhooks
     ./build/install-build-deps.sh --no-prompt
